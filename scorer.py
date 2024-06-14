@@ -66,7 +66,7 @@ class EDMScorer(torch.nn.Module):
         return batch_scores
 
 
-def test_runner():
+def test_runner(device='cpu'):
     model_root = "https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions"
     netpath = f"{model_root}/edm2-img64-s-1073741-0.075.pkl"
     with dnnlib.util.open_url(netpath, verbose=1) as f:
@@ -77,8 +77,8 @@ def test_runner():
     image = (PIL.Image.open(f)).resize((64, 64), PIL.Image.Resampling.LANCZOS)
     image = np.array(image)
     image = image.reshape(*image.shape[:2], -1).transpose(2, 0, 1)
-    x = torch.from_numpy(image).unsqueeze(0)
-    model = EDMScorer(net, num_steps=5)
+    x = torch.from_numpy(image).unsqueeze(0).to(device)
+    model = EDMScorer(net, num_steps=5).to(device)
     scores = model(x)
     return scores
 
