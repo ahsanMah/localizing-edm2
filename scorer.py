@@ -92,21 +92,18 @@ def runner(dataset_path, device='cpu'):
     dsobj = ImageFolderDataset(path=dataset_path, resolution=64)
     refimg, reflabel = dsobj[0]
     print(refimg.shape, refimg.dtype, reflabel)
-    dsloader = torch.utils.data.DataLoader(dsobj, batch_size=32, num_workers=2, prefetch_factor=2)
+    dsloader = torch.utils.data.DataLoader(dsobj, batch_size=48, num_workers=4, prefetch_factor=2)
     
     model = build_model(device=device) 
     score_norms = []
 
     for x,_ in tqdm(dsloader):
-        print(x.shape)
         s = model(x.to(device))
         s = s.square().sum(dim=(2,3,4)) ** 0.5
         score_norms.append(s.cpu())
 
-        break
-
     score_norms = torch.cat(score_norms, dim=0)
-   
+    
     os.makedirs('out/msma', exist_ok=True)
     with open('out/msma/imagenette64_score_norms.pt', 'wb') as f:
         torch.save(score_norms, f)
