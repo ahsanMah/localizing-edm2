@@ -1,3 +1,4 @@
+import os
 import pickle
 
 import numpy as np
@@ -94,14 +95,23 @@ def runner(dataset_path, device='cpu'):
     dsloader = torch.utils.data.DataLoader(dsobj, batch_size=32, num_workers=2, prefetch_factor=2)
     
     model = build_model(device=device) 
+    score_norms = []
 
     for x,_ in tqdm(dsloader):
         print(x.shape)
         s = model(x.to(device))
         s = s.square().sum(dim=(2,3,4)) ** 0.5
-        print(s.shape)
+        score_norms.append(s.cpu())
 
         break
+
+    score_norms = torch.cat(score_norms, dim=0)
+   
+    os.makedirs('out/msma', exist_ok=True)
+    with open('out/msma/imagenette64_score_norms.pt', 'wb') as f:
+        torch.save(score_norms, f)
+
+    print(f'Computed score norms for {score_norms.shape[0]} samples')
 
 if __name__ == "__main__":
     #s = test_runner()
