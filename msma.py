@@ -1,5 +1,6 @@
 import os
 import pickle
+from functools import partial
 from pickle import dump, load
 
 import numpy as np
@@ -9,6 +10,7 @@ from sklearn.mixture import GaussianMixture
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from torch.utils.data import Subset
 from tqdm import tqdm
 
 import dnnlib
@@ -22,6 +24,17 @@ config_presets = {
     "edm2-img64-m-fid": f"{model_root}/edm2-img64-m-2147483-0.060.pkl",  # fid = 1.43
     "edm2-img64-l-fid": f"{model_root}/edm2-img64-l-1073741-0.040.pkl",  # fid = 1.33
 }
+
+
+class StandardRGBEncoder:
+    def __init__(self):
+        super().__init__()
+
+    def encode(self, x):  # raw pixels => final pixels
+        return x.to(torch.float32) / 127.5 - 1
+
+    def decode(self, x):  # final latents => raw pixels
+        return (x.to(torch.float32) * 127.5 + 128).clip(0, 255).to(torch.uint8)
 
 
 class EDMScorer(torch.nn.Module):
@@ -43,6 +56,7 @@ class EDMScorer(torch.nn.Module):
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
         self.net = net.eval()
+        self.encoder = StandardRGBEncoder()
 
         # Adjust noise levels based on how far we want to accumulate
         self.sigma_min = 1e-1
@@ -65,7 +79,7 @@ class EDMScorer(torch.nn.Module):
         x,
         force_fp32=False,
     ):
-        x = x.to(torch.float32)
+        x = self.encoder.encode(x).to(torch.float32)
 
         batch_scores = []
         for sigma in self.sigma_steps:
@@ -83,13 +97,13 @@ class ScoreFlow(torch.nn.Module):
         self,
         scorenet,
         vectorize=False,
-        device='cpu',
+        device="cpu",
     ):
         super().__init__()
 
         h = w = scorenet.net.img_resolution
         c = scorenet.net.img_channels
-        num_sigmas = len(scorenet.sigma_steps)        
+        num_sigmas = len(scorenet.sigma_steps)
         self.flow = PatchFlow((num_sigmas, c, h, w))
 
         self.flow = self.flow.to(device)
@@ -110,41 +124,44 @@ def build_model(preset="edm2-img64-s-fid", device="cpu"):
     return model
 
 
-def train_gmm(score_path, outdir):
-    def quantile_scorer(gmm, X, y=None):
-        return np.quantile(gmm.score_samples(X), 0.1)
+def quantile_scorer(gmm, X, y=None):
+    return np.quantile(gmm.score_samples(X), 0.1)
 
+
+def train_gmm(score_path, outdir, grid_search=False):
     X = torch.load(score_path)
 
     gm = GaussianMixture(
         n_components=7, init_params="kmeans", covariance_type="full", max_iter=100000
     )
-    clf = Pipeline([("scaler", StandardScaler()), ("GMM", gm)])
+
+    if grid_search:
+        clf = Pipeline([("scaler", StandardScaler()), ("GMM", gm)])
+        param_grid = dict(
+            GMM__n_components=range(2, 11, 1),
+        )
+
+        grid = GridSearchCV(
+            estimator=clf,
+            param_grid=param_grid,
+            cv=5,
+            n_jobs=2,
+            verbose=1,
+            scoring=quantile_scorer,
+        )
+
+        grid_result = grid.fit(X)
+
+        print("Best: %f using %s" % (grid_result.best_score_, grid_result.best_params_))
+        print("-----" * 15)
+        means = grid_result.cv_results_["mean_test_score"]
+        stds = grid_result.cv_results_["std_test_score"]
+        params = grid_result.cv_results_["params"]
+        for mean, stdev, param in zip(means, stds, params):
+            print("%f (%f) with: %r" % (mean, stdev, param))
+        clf = grid.best_estimator_
+
     clf.fit(X)
-    # param_grid = dict(
-    #     GMM__n_components=range(2, 11, 1),
-    # )
-
-    # grid = GridSearchCV(
-    #     estimator=clf,
-    #     param_grid=param_grid,
-    #     cv=5,
-    #     n_jobs=2,
-    #     verbose=1,
-    #     scoring=quantile_scorer,
-    # )
-
-    # grid_result = grid.fit(X)
-
-    # print("Best: %f using %s" % (grid_result.best_score_, grid_result.best_params_))
-    # print("-----" * 15)
-    # means = grid_result.cv_results_["mean_test_score"]
-    # stds = grid_result.cv_results_["std_test_score"]
-    # params = grid_result.cv_results_["params"]
-    # for mean, stdev, param in zip(means, stds, params):
-    #     print("%f (%f) with: %r" % (mean, stdev, param))
-
-    # clf = grid.best_estimator_
     inlier_nll = -clf.score_samples(X)
 
     os.makedirs(outdir, exist_ok=True)
@@ -191,8 +208,75 @@ def cache_score_norms(preset, dataset_path, device="cpu"):
 
     print(f"Computed score norms for {score_norms.shape[0]} samples")
 
-def train_flow(dataset_path):
-    pass
+
+def train_flow(dataset_path, preset, device="cuda"):
+    dsobj = ImageFolderDataset(path=dataset_path, resolution=64)
+    refimg, reflabel = dsobj[0]
+    print(f"Loaded {len(dsobj)} samples from {dataset_path}")
+
+    # Subset of training dataset
+    val_ratio = 0.1
+    train_len = int((1 - val_ratio) * len(dsobj))
+    val_len = len(dsobj) - train_len
+
+    print(f"Generating train/test split with ratio={val_ratio} -> {train_len}/{val_len}...")
+    train_ds = Subset(dsobj, range(train_len))
+    val_ds = Subset(dsobj, range(train_len, train_len + val_len))
+
+    trainiter = torch.utils.data.DataLoader(
+        train_ds, batch_size=48, num_workers=4, prefetch_factor=2
+    )
+    testiter = torch.utils.data.DataLoader(
+        val_ds, batch_size=48, num_workers=4, prefetch_factor=2
+    )
+
+    model = ScoreFlow(build_model(preset=preset), device=device)
+    opt = torch.optim.AdamW(model.flow.parameters(), lr=3e-4, weight_decay=1e-5)
+    train_step = partial(
+        PatchFlow.stochastic_step,
+        flow_model=model.flow,
+        opt=opt,
+        train=True,
+        n_patches=64,
+        device=device,
+    )
+    eval_step = partial(
+        PatchFlow.stochastic_step,
+        flow_model=model.flow,
+        train=False,
+        n_patches=128,
+        device=device,
+    )
+
+    pbar = tqdm(trainiter, desc="Train Loss: ? - Val Loss: ?")
+    step = 0
+
+    for x, _ in tqdm(trainiter):
+        x = x.to(device)
+        scores = model.scorenet(x)
+
+        if step == 0:
+            with torch.inference_mode():
+                val_loss = eval_step(scores, x)
+
+        train_loss = train_step(scores, x)
+
+        if (step + 1) % 10 == 0:
+            
+            with torch.inference_mode():
+                val_loss = 0.0
+                for i, (x, _) in enumerate(testiter):
+                    x = x.to(device)
+                    scores = model.scorenet(x)
+                    val_loss += eval_step(scores, x)
+                    break
+                val_loss /= i + 1
+            
+        pbar.set_description(f"Step: {step:d} - Train: {train_loss:.3f} - Val: {val_loss:.3f}")
+        step += 1
+
+    torch.save(model.flow.state_dict(), f"out/msma/{preset}/flow.pt")
+
 
 @torch.inference_mode
 def test_runner(device="cpu"):
@@ -208,34 +292,40 @@ def test_runner(device="cpu"):
     return scores
 
 
-def test_flow(device="cpu"):
-    # f = "doge.jpg"
-    f = "goldfish.JPEG"
+def test_flow_runner(device="cpu", load_weights=None):
+    f = "doge.jpg"
+    # f = "goldfish.JPEG"
     image = (PIL.Image.open(f)).resize((64, 64), PIL.Image.Resampling.LANCZOS)
     image = np.array(image)
     image = image.reshape(*image.shape[:2], -1).transpose(2, 0, 1)
     x = torch.from_numpy(image).unsqueeze(0).to(device)
     model = build_model(device=device)
-    
+
     score_flow = ScoreFlow(scorenet=model, device=device)
+
+    if load_weights is not None:
+        score_flow.flow.load_state_dict(torch.load(load_weights))
+
     heatmap = score_flow(x)
     print(heatmap.shape)
 
     heatmap = score_flow(x).detach().cpu().numpy()
     heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min()) * 255
     im = PIL.Image.fromarray(heatmap[0, 0])
-    im.convert('RGB').save("heatmap.png", )
+    im.convert("RGB").save(
+        "heatmap.png",
+    )
 
-    scores = model(x)
-    loss = PatchFlow.stochastic_step(scores, x_batch=x, flow_model=score_flow.flow, device=device)
-
-    return loss
+    return
 
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     preset = "edm2-img64-s-fid"
-    print(test_flow('cuda'))
+    imagenette_path = "/GROND_STOR/amahmood/datasets/img64/"
+
+    train_flow(imagenette_path, preset, device)
+    test_flow_runner('cuda', f'out/msma/{preset}/flow.pt')
 
     # cache_score_norms(
     #     preset=preset,
