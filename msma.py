@@ -12,6 +12,7 @@ from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
 import dnnlib
+from flowutils import PatchFlow
 from training.dataset import ImageFolderDataset
 
 model_root = "https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions"
@@ -75,6 +76,25 @@ class EDMScorer(torch.nn.Module):
         batch_scores = torch.stack(batch_scores, axis=1)
 
         return batch_scores
+
+
+class ScoreFlow(torch.nn.Module):
+    def __init__(
+        self,
+        flow,
+        scorenet,
+        vectorize=False,
+        device='cpu',
+    ):
+        super().__init__()
+        self.flow = flow.to(device)
+        self.scorenet = scorenet.to(device).requires_grad_(False)
+
+        self.flow.init_weights()
+
+    def forward(self, x, **score_kwargs):
+        x_scores = self.scorenet(x, **score_kwargs)
+        return self.flow(x_scores)
 
 
 def build_model(preset="edm2-img64-s-fid", device="cpu"):
@@ -167,6 +187,8 @@ def cache_score_norms(preset, dataset_path, device="cpu"):
 
     print(f"Computed score norms for {score_norms.shape[0]} samples")
 
+def train_flow(dataset_path):
+    pass
 
 def test_runner(device="cpu"):
     # f = "doge.jpg"
