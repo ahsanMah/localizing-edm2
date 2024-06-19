@@ -190,6 +190,7 @@ def cache_score_norms(preset, dataset_path, device="cpu"):
 def train_flow(dataset_path):
     pass
 
+@torch.inference_mode
 def test_runner(device="cpu"):
     # f = "doge.jpg"
     f = "goldfish.JPEG"
@@ -199,20 +200,30 @@ def test_runner(device="cpu"):
     x = torch.from_numpy(image).unsqueeze(0).to(device)
     model = build_model(device=device)
     scores = model(x)
-    return scores
 
+    c,h,w = image.shape
+    num_sigmas = len(model.sigma_steps)
+    flows = PatchFlow((num_sigmas, c, h, w))
+    score_flow = ScoreFlow(flow=flows, scorenet=model, device=device)
+    heatmap = score_flow(x).cpu().numpy()
+    print(heatmap.shape)
+    # heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min()) * 255
+    # im = PIL.Image.fromarray(heatmap[0, 0])
+    # im.convert('RGB').save("heatmap.png", )
+
+    return scores
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     preset = "edm2-img64-s-fid"
-    cache_score_norms(
-        preset=preset,
-        dataset_path="/GROND_STOR/amahmood/datasets/img64/",
-        device="cuda",
-    )
-    train_gmm(
-        f"out/msma/{preset}_imagenette_score_norms.pt", outdir=f"out/msma/{preset}"
-    )
+    # cache_score_norms(
+    #     preset=preset,
+    #     dataset_path="/GROND_STOR/amahmood/datasets/img64/",
+    #     device="cuda",
+    # )
+    # train_gmm(
+    #     f"out/msma/{preset}_imagenette_score_norms.pt", outdir=f"out/msma/{preset}"
+    # )
     s = test_runner(device=device)
     s = s.square().sum(dim=(2, 3, 4)) ** 0.5
     s = s.to("cpu").numpy()

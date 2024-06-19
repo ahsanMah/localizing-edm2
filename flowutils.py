@@ -1,3 +1,5 @@
+import pdb
+
 import normflows as nf
 import numpy as np
 import torch
@@ -23,7 +25,7 @@ def build_flows(
         flows += [nf.flows.LULinearPermute(latent_size)]
 
     # Set base distribution
-    q0 = nf.distributions.DiagGaussian(2, trainable=False)
+    q0 = nf.distributions.DiagGaussian(latent_size, trainable=True)
 
     # Construct flow model
     model = nf.ConditionalNormalizingFlow(q0, flows)
@@ -60,11 +62,11 @@ class PositionalEncoding2D(nn.Module):
         if len(tensor.shape) != 4:
             raise RuntimeError("The input tensor has to be 4d!")
 
-        if self.cached_penc is not None and self.cached_penc.shape == tensor.shape:
+        if self.cached_penc is not None and self.cached_penc.shape[:2] == tensor.shape[1:3]:
             return self.cached_penc
 
         self.cached_penc = None
-        batch_size, x, y, orig_ch = tensor.shape
+        batch_size, orig_ch, x, y = tensor.shape
         pos_x = torch.arange(x, device=tensor.device, dtype=self.inv_freq.dtype)
         pos_y = torch.arange(y, device=tensor.device, dtype=self.inv_freq.dtype)
         sin_inp_x = torch.einsum("i,j->ij", pos_x, self.inv_freq)
@@ -79,20 +81,33 @@ class PositionalEncoding2D(nn.Module):
         emb[:, :, : self.channels] = emb_x
         emb[:, :, self.channels : 2 * self.channels] = emb_y
 
-        self.cached_penc = emb[None, :, :, :orig_ch].repeat(tensor.shape[0], 1, 1, 1)
+        self.cached_penc = emb
+
         return self.cached_penc
 
-class SpatialNormer(nn.Module):
 
-    def __init__(self, in_channels, kernel_size=3, stride=2, padding=1):
+class SpatialNormer(nn.Module):
+    def __init__(
+        self,
+        in_channels,  # channels will be number of sigma scales in input
+        kernel_size=3,
+        stride=2,
+        padding=1,
+    ):
+        """
+        Note that the convolution will reduce the channel dimension
+        So (b, num_sigmas, c, h, w) -> (b, num_sigmas, new_h , new_w)
+        """
         super().__init__()
-        self.conv = nn.Conv2d(
+        self.conv = nn.Conv3d(
             in_channels,
             in_channels,
             kernel_size,
+            # This is the real trick that ensures each
+            # sigma dimension is normed separately
             groups=in_channels,
-            stride=stride,
-            padding=padding,
+            stride=(1, stride, stride),
+            padding=(0, padding, padding),
             bias=False,
         )
         self.conv.weight.data.fill_(1)  # all ones weights
@@ -100,11 +115,11 @@ class SpatialNormer(nn.Module):
 
     @torch.no_grad()
     def forward(self, x):
-        return self.conv(x.square()).pow_(0.5)
+        return self.conv(x.square()).pow_(0.5).squeeze(2)
 
 
 class PatchFlow(torch.nn.Module):
-    def init(
+    def __init__(
         self,
         input_size,
         patch_size=3,
@@ -112,13 +127,20 @@ class PatchFlow(torch.nn.Module):
         num_blocks=2,
         hidden_units=128,
     ):
-        c, h, w = input_size
-        self.local_pooler = SpatialNormer(in_channels=c, kernel_size=patch_size)
-        self.flow = build_flows()
+        super().__init__()
+        num_sigmas, c, h, w = input_size
+        self.local_pooler = SpatialNormer(
+            in_channels=num_sigmas, kernel_size=patch_size
+        )
+        self.flow = build_flows(
+            latent_size=num_sigmas, context_size=context_embedding_size
+        )
         self.position_encoding = PositionalEncoding2D(channels=context_embedding_size)
 
         # caching pos encs
-        self.position_encoding(self.local_pooler(torch.empty((1,c,h,w))))
+        _,_,ctx_h, ctw_w = self.local_pooler(torch.empty((1, num_sigmas, c, h, w))).shape
+        self.position_encoding(torch.empty(1,1, ctx_h, ctw_w ))
+        assert self.position_encoding.cached_penc.shape[-1] == context_embedding_size
 
     def init_weights(self):
         # Initialize weights with Xavier
@@ -126,7 +148,7 @@ class PatchFlow(torch.nn.Module):
             filter(lambda m: isinstance(m, nn.Linear), self.flow.modules())
         )
         total = len(linear_modules)
-        # pdb.set_trace()
+
         for idx, m in enumerate(linear_modules):
             # Last layer gets init w/ zeros
             if idx == total - 1:
@@ -138,40 +160,45 @@ class PatchFlow(torch.nn.Module):
                 nn.init.zeros_(m.bias.data)
 
     def forward(self, x, chunk_size=32):
-
+        b, s, c, h, w = x.shape
         x_norm = self.local_pooler(x)
+        _,_, new_h, new_w = x_norm.shape
         context = self.position_encoding(x_norm)
 
         # (Patches * batch) x channels
-        local_ctx = rearrange(context, "b c h w -> (h w) b c")
-        patches = rearrange(x, "b c h w -> (h w) b c")
+        local_ctx = rearrange(context, "h w c -> (h w) c")
+        patches = rearrange(x_norm, "b c h w -> (h w) b c")
 
         nchunks = (patches.shape[0] + chunk_size - 1) // chunk_size
         patches = patches.chunk(nchunks, dim=0)
         ctx_chunks = local_ctx.chunk(nchunks, dim=0)
-        zs, jacs = [], []
+        patch_logpx = []
 
         # gc = repeat(global_ctx, "b c -> (n b) c", n=self.patch_batch_size)
 
         for p, ctx in zip(patches, ctx_chunks):
-            # Check that patch context is same for all batch elements
-            #             assert torch.isclose(c[0, :32], c[B-1, :32]).all()
-            #             assert torch.isclose(c[B+1, :32], c[(2*B)-1, :32]).all()
-            ctx = rearrange(ctx, "n b c -> (n b) c")
+
+            # num patches in chunk (<= chunk_size)
+            n = p.shape[0]
+            ctx = repeat(ctx, "n c -> (n b) c", b=b)
             p = rearrange(p, "n b c -> (n b) c")
 
-            z, ldj = self.flow.inverse_and_log_det(p, context=ctx)
+            # Compute log densities for each patch
+            logpx = self.flow.log_prob(p, context=ctx)
+            logpx = rearrange(logpx, "(n b) -> n b", n=n, b=b)
+            patch_logpx.append(logpx)
+            # del ctx, p
 
-            zs.append(z)
-            jacs.append(ldj)
+        # print(p[:4], ctx[:4], logpx)
+        # Convert back to image
+        logpx = torch.cat(patch_logpx, dim=0)
+        logpx = rearrange(logpx, "(h w) b -> b 1 h w", b=b, h=new_h, w=new_w)
 
-            del ctx, p
-
-        return zs, jacs
+        return logpx.contiguous()
 
     @staticmethod
     def stochastic_step(
-        scores, x_batch, flow_model, opt=None, train=False, n_patches=1
+        scores, x_batch, flow_model, opt=None, train=False, n_patches=32
     ):
         if train:
             flow_model.train()
@@ -200,7 +227,8 @@ class PatchFlow(torch.nn.Module):
             context=context_vector,
         )
 
-        loss = flow_model.nll(z, ldj) * n_patches
+        loss = -torch.mean(flow_model.q0.log_prob(z) + ldj)
+        loss *= n_patches
 
         if train:
             loss.backward()
