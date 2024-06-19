@@ -15,11 +15,11 @@ def build_flows(
     flows = []
     for i in range(num_flows):
         flows += [
-            nf.flows.MaskedAffineAutoregressive(
+            nf.flows.CoupledRationalQuadraticSpline(
                 latent_size,
-                hidden_units,
-                context_features=context_size,
                 num_blocks=num_blocks,
+                num_hidden_channels=hidden_units,
+                num_context_channels=context_size,
             )
         ]
         flows += [nf.flows.LULinearPermute(latent_size)]
@@ -198,7 +198,7 @@ class PatchFlow(torch.nn.Module):
 
     @staticmethod
     def stochastic_step(
-        scores, x_batch, flow_model, opt=None, train=False, n_patches=32
+        scores, x_batch, flow_model, opt=None, train=False, n_patches=32, device='cpu'
     ):
         if train:
             flow_model.train()
@@ -210,24 +210,24 @@ class PatchFlow(torch.nn.Module):
             scores, x_batch, flow_model, n_patches
         )
 
-        patch_feature = patches.to(flow_model.device)
-        context_vector = context.to(flow_model.device)
+        patch_feature = patches.to(device)
+        context_vector = context.to(device)
         patch_feature = rearrange(patch_feature, "n b c -> (n b) c")
         context_vector = rearrange(context_vector, "n b c -> (n b) c")
 
-        global_pooled_image = flow_model.global_pooler(x_batch)
-        global_context = flow_model.global_attention(global_pooled_image)
-        gctx = repeat(global_context, "b c -> (n b) c", n=n_patches)
+        # global_pooled_image = flow_model.global_pooler(x_batch)
+        # global_context = flow_model.global_attention(global_pooled_image)
+        # gctx = repeat(global_context, "b c -> (n b) c", n=n_patches)
 
-        # Concatenate global context to local context
-        context_vector = torch.cat([context_vector, gctx], dim=1)
+        # # Concatenate global context to local context
+        # context_vector = torch.cat([context_vector, gctx], dim=1)
 
         z, ldj = flow_model.flow.inverse_and_log_det(
             patch_feature,
             context=context_vector,
         )
 
-        loss = -torch.mean(flow_model.q0.log_prob(z) + ldj)
+        loss = -torch.mean(flow_model.flow.q0.log_prob(z) + ldj)
         loss *= n_patches
 
         if train:
@@ -238,14 +238,21 @@ class PatchFlow(torch.nn.Module):
 
     @staticmethod
     def get_random_patches(scores, x_batch, flow_model, n_patches):
-        h = flow_model.local_pooler(scores).cpu()
-        flow_model.position_encoder = flow_model.position_encoder.cpu()
-        local_patches = rearrange(h, "b c h w -> (h w) b c")
-        context = rearrange(flow_model.position_encoder(h), "b c h w d -> (h w) b c")
+        b = scores.shape[0]
+        h = flow_model.local_pooler(scores)
+        patches = rearrange(h, "b c h w -> (h w) b c")
+
+        context = flow_model.position_encoding(h)
+        context = rearrange(context, "h w c -> (h w) c")
+        context = repeat(context, "n c -> n b c", b=b)
+
+        # conserve gpu memory
+        patches = patches.cpu()
+        context = context.cpu()
 
         # Get random patches
-        total_patches = local_patches.shape[0]
+        total_patches = patches.shape[0]
         shuffled_idx = torch.randperm(total_patches)
         rand_idx_batch = shuffled_idx[:n_patches]
 
-        return local_patches[rand_idx_batch], context[rand_idx_batch]
+        return patches[rand_idx_batch], context[rand_idx_batch]

@@ -81,15 +81,19 @@ class EDMScorer(torch.nn.Module):
 class ScoreFlow(torch.nn.Module):
     def __init__(
         self,
-        flow,
         scorenet,
         vectorize=False,
         device='cpu',
     ):
         super().__init__()
-        self.flow = flow.to(device)
-        self.scorenet = scorenet.to(device).requires_grad_(False)
 
+        h = w = scorenet.net.img_resolution
+        c = scorenet.net.img_channels
+        num_sigmas = len(scorenet.sigma_steps)        
+        self.flow = PatchFlow((num_sigmas, c, h, w))
+
+        self.flow = self.flow.to(device)
+        self.scorenet = scorenet.to(device).requires_grad_(False)
         self.flow.init_weights()
 
     def forward(self, x, **score_kwargs):
@@ -201,21 +205,38 @@ def test_runner(device="cpu"):
     model = build_model(device=device)
     scores = model(x)
 
-    c,h,w = image.shape
-    num_sigmas = len(model.sigma_steps)
-    flows = PatchFlow((num_sigmas, c, h, w))
-    score_flow = ScoreFlow(flow=flows, scorenet=model, device=device)
-    heatmap = score_flow(x).cpu().numpy()
-    print(heatmap.shape)
-    # heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min()) * 255
-    # im = PIL.Image.fromarray(heatmap[0, 0])
-    # im.convert('RGB').save("heatmap.png", )
-
     return scores
+
+
+def test_flow(device="cpu"):
+    # f = "doge.jpg"
+    f = "goldfish.JPEG"
+    image = (PIL.Image.open(f)).resize((64, 64), PIL.Image.Resampling.LANCZOS)
+    image = np.array(image)
+    image = image.reshape(*image.shape[:2], -1).transpose(2, 0, 1)
+    x = torch.from_numpy(image).unsqueeze(0).to(device)
+    model = build_model(device=device)
+    
+    score_flow = ScoreFlow(scorenet=model, device=device)
+    heatmap = score_flow(x)
+    print(heatmap.shape)
+
+    heatmap = score_flow(x).detach().cpu().numpy()
+    heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min()) * 255
+    im = PIL.Image.fromarray(heatmap[0, 0])
+    im.convert('RGB').save("heatmap.png", )
+
+    scores = model(x)
+    loss = PatchFlow.stochastic_step(scores, x_batch=x, flow_model=score_flow.flow, device=device)
+
+    return loss
+
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     preset = "edm2-img64-s-fid"
+    print(test_flow('cuda'))
+
     # cache_score_norms(
     #     preset=preset,
     #     dataset_path="/GROND_STOR/amahmood/datasets/img64/",
@@ -224,8 +245,8 @@ if __name__ == "__main__":
     # train_gmm(
     #     f"out/msma/{preset}_imagenette_score_norms.pt", outdir=f"out/msma/{preset}"
     # )
-    s = test_runner(device=device)
-    s = s.square().sum(dim=(2, 3, 4)) ** 0.5
-    s = s.to("cpu").numpy()
-    nll, pct = compute_gmm_likelihood(s, gmmdir=f"out/msma/{preset}/")
-    print(f"Anomaly score for image: {nll[0]:.3f} @ {pct*100:.2f} percentile")
+    # s = test_runner(device=device)
+    # s = s.square().sum(dim=(2, 3, 4)) ** 0.5
+    # s = s.to("cpu").numpy()
+    # nll, pct = compute_gmm_likelihood(s, gmmdir=f"out/msma/{preset}/")
+    # print(f"Anomaly score for image: {nll[0]:.3f} @ {pct*100:.2f} percentile")
